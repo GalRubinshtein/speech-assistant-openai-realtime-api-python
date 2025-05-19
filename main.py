@@ -8,18 +8,17 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from dotenv import load_dotenv
+import logging
+from datetime import datetime
+from time import time
+
 
 load_dotenv()
 
+
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-PORT = int(os.getenv('PORT', 5050))
-SYSTEM_MESSAGE = (
-    "You are a helpful and bubbly AI assistant who loves to chat about "
-    "anything the user is interested in and is prepared to offer them facts. "
-    "You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. "
-    "Always stay positive, but work in a joke when appropriate."
-)
+PORT = int(os.getenv('PORT', 5051))
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
@@ -34,6 +33,37 @@ app = FastAPI()
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
 
+
+def load_prompt(file_path):
+    with open(file_path, encoding="utf-8") as f:
+        return f.read()
+
+
+def load_opening(file_path):
+    with open(file_path, encoding="utf-8") as f:
+        return f.read()
+
+
+def create_session_logger(stream_sid: str, log_dir="logs") -> logging.Logger:
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"{stream_sid or 'session'}_{timestamp}.log"
+    filepath = os.path.join(log_dir, filename)
+
+    logger = logging.getLogger(stream_sid or f"session_{timestamp}")
+    logger.setLevel(logging.DEBUG)
+
+    if not logger.handlers:
+        file_handler = logging.FileHandler(filepath, encoding='utf-8')
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
+
+SYSTEM_MESSAGE = load_prompt("prompt.txt")
+OPEN_MESSAGE = load_opening("opening.txt")
+
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
@@ -42,10 +72,6 @@ async def index_page():
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
-    # <Say> punctuation to improve text-to-speech flow
-    response.say("Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open-A.I. Realtime API")
-    response.pause(length=1)
-    response.say("O.K. you can start talking!")
     host = request.url.hostname
     connect = Connect()
     connect.stream(url=f'wss://{host}/media-stream')
@@ -73,6 +99,10 @@ async def handle_media_stream(websocket: WebSocket):
         last_assistant_item = None
         mark_queue = []
         response_start_timestamp_twilio = None
+        session_logger = None
+        speech_end_timestamp = None
+        response_start_timestamp = None
+        full_response_text = ""
         
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
@@ -88,6 +118,8 @@ async def handle_media_stream(websocket: WebSocket):
                         }
                         await openai_ws.send(json.dumps(audio_append))
                     elif data['event'] == 'start':
+                        session_logger = create_session_logger(stream_sid)
+                        session_logger.info(f"[SESSION STARTED] streamSid: {stream_sid}")
                         stream_sid = data['start']['streamSid']
                         print(f"Incoming stream has started {stream_sid}")
                         response_start_timestamp_twilio = None
@@ -104,6 +136,7 @@ async def handle_media_stream(websocket: WebSocket):
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
             nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio
+            
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -193,7 +226,7 @@ async def send_initial_conversation_item(openai_ws):
             "content": [
                 {
                     "type": "input_text",
-                    "text": "Greet the user with 'Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?'"
+                    "text": OPEN_MESSAGE
                 }
             ]
         }
@@ -220,7 +253,7 @@ async def initialize_session(openai_ws):
     await openai_ws.send(json.dumps(session_update))
 
     # Uncomment the next line to have the AI speak first
-    # await send_initial_conversation_item(openai_ws)
+    await send_initial_conversation_item(openai_ws)
 
 if __name__ == "__main__":
     import uvicorn
