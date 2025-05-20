@@ -12,10 +12,9 @@ import logging
 from datetime import datetime
 from time import time
 
-
 load_dotenv()
 
-
+# היי, כאן דנה ממחלקת התמיכה. אני כאן כדי לעזור עם כל תקלה או שאלה. איך אוכל לעזור?
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 PORT = int(os.getenv('PORT', 5051))
@@ -24,7 +23,8 @@ LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
     'input_audio_buffer.speech_stopped', 'input_audio_buffer.speech_started',
-    'session.created'
+    'session.created', 'response.created', 'response.output_item.added', 'response.content_part.added',
+    'response.text.delta', 'response.text.done', 'response.content_part.done', 'response.output_item.done'
 ]
 SHOW_TIMING_MATH = False
 
@@ -47,10 +47,10 @@ def load_opening(file_path):
 def create_session_logger(stream_sid: str, log_dir="logs") -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    filename = f"{stream_sid or 'session'}_{timestamp}.log"
+    filename = f"{timestamp}_{stream_sid or 'session'}.jsonl"
     filepath = os.path.join(log_dir, filename)
 
-    logger = logging.getLogger(stream_sid or f"session_{timestamp}")
+    logger = logging.getLogger(f"{timestamp}_{stream_sid or 'session'}")
     logger.setLevel(logging.DEBUG)
 
     if not logger.handlers:
@@ -61,8 +61,10 @@ def create_session_logger(stream_sid: str, log_dir="logs") -> logging.Logger:
 
     return logger
 
+
 SYSTEM_MESSAGE = load_prompt("prompt.txt")
 OPEN_MESSAGE = load_opening("opening.txt")
+
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -84,6 +86,8 @@ async def handle_media_stream(websocket: WebSocket):
     print("Client connected")
     await websocket.accept()
 
+    session_logger = None
+
     async with websockets.connect(
         'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
         extra_headers={
@@ -99,7 +103,6 @@ async def handle_media_stream(websocket: WebSocket):
         last_assistant_item = None
         mark_queue = []
         response_start_timestamp_twilio = None
-        session_logger = None
         speech_end_timestamp = None
         response_start_timestamp = None
         full_response_text = ""
@@ -118,9 +121,10 @@ async def handle_media_stream(websocket: WebSocket):
                         }
                         await openai_ws.send(json.dumps(audio_append))
                     elif data['event'] == 'start':
+                        stream_sid = data['start']['streamSid']
+                        nonlocal session_logger  # allow modifying the outer variable
                         session_logger = create_session_logger(stream_sid)
                         session_logger.info(f"[SESSION STARTED] streamSid: {stream_sid}")
-                        stream_sid = data['start']['streamSid']
                         print(f"Incoming stream has started {stream_sid}")
                         response_start_timestamp_twilio = None
                         latest_media_timestamp = 0
@@ -130,17 +134,22 @@ async def handle_media_stream(websocket: WebSocket):
                             mark_queue.pop(0)
             except WebSocketDisconnect:
                 print("Client disconnected.")
+                if session_logger:
+                    session_logger.info("[SESSION ENDED] WebSocket disconnected.")
                 if openai_ws.open:
                     await openai_ws.close()
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
             nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio
-            
+            nonlocal full_response_text
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
+
                     if response['type'] in LOG_EVENT_TYPES:
+                        if session_logger:
+                            session_logger.info(f"[EVENT] {response['type']}: {response}")
                         print(f"Received event: {response['type']}", response)
 
                     if response.get('type') == 'response.audio.delta' and 'delta' in response:
